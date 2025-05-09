@@ -27,7 +27,6 @@ class ProcessingElement:
         # PE state
         self.idle = True
         self.stalled = False
-        self.stall_cycles_remaining = 0
         self.pending_callback = None
         
         # Task processing state
@@ -35,6 +34,7 @@ class ProcessingElement:
         self.task_queue = []
         self.input_fibers = []
         self.scaling_factors = []
+        self.scaling_factors_valid = False  # New signal to indicate if scaling factors are valid
         self.fiber_indices = []
         self.accumulator = {}
         
@@ -46,6 +46,9 @@ class ProcessingElement:
         self.fetch_stage = {"valid": False, "data": None}
         self.merge_stage = {"valid": False, "data": None, "fiber_idx": -1}
         self.compute_stage = {"valid": False, "coord": -1, "value": 0.0, "scale_factor": 0.0}
+        
+        # Cache line size (in elements)
+        self.cache_line_size = 16
         
         # Debug info
         self.debug_log = []
@@ -59,6 +62,15 @@ class ProcessingElement:
     def set_fiber_cache(self, fiber_cache):
         self.fiber_cache = fiber_cache
     
+    def set_scaling_factors(self, scaling_factors):
+        """Set the scaling factors for the current task from the scheduler"""
+        self.scaling_factors = scaling_factors.copy()
+        self.scaling_factors_valid = True
+        self.log(f"Received valid scaling factors: {scaling_factors}")
+        
+        # Check if we can start the pipeline now
+        self._check_start_pipeline()
+    
     def assign_task(self, task):
         """Assign a task to this PE
         
@@ -69,7 +81,6 @@ class ProcessingElement:
           * start_idx: Starting index in the arrays
           * end_idx: Ending index in the arrays
         - input_consume_flags: List of booleans indicating whether to consume (True) or read (False) each input
-        - scaling_factors: List of factors to scale each input by
         - output_col_indices_addr: Address to write output column indices
         - output_values_addr: Address to write output values
         """
@@ -92,7 +103,8 @@ class ProcessingElement:
         # Initialize processing state
         num_inputs = len(self.current_task["input_row_data"])
         self.input_fibers = [None] * num_inputs
-        self.scaling_factors = self.current_task["scaling_factors"].copy()
+        self.scaling_factors = []  # Will be set by scheduler via set_scaling_factors
+        self.scaling_factors_valid = False  # Reset validity
         self.fiber_indices = [0] * num_inputs
         self.accumulator = {}
         
@@ -120,13 +132,30 @@ class ProcessingElement:
                 'should_consume': should_consume,
                 'col_indices': None,
                 'values': None,
-                'loaded': False
+                'loaded': False,
+                'current_block_index': 0,
+                'total_blocks': (end_idx - start_idx + self.cache_line_size - 1) // self.cache_line_size,
+                'col_indices_collected': [],
+                'values_collected': []
             })
         
         self.log(f"Starting task with {num_inputs} input rows")
         
         # Start loading the rows
         self._load_input_rows()
+    
+    def _check_start_pipeline(self):
+        """Check if we can start the pipeline"""
+        if not self.pipeline_started:
+            all_rows_loaded = all(state['loaded'] for state in self.row_loading_state) if self.row_loading_state else False
+            
+            if all_rows_loaded and self.scaling_factors_valid:
+                self.log("All rows loaded and scaling factors valid, starting pipeline")
+                self.pipeline_started = True
+            elif all_rows_loaded:
+                self.log("All rows loaded but waiting for valid scaling factors")
+            elif self.scaling_factors_valid:
+                self.log("Scaling factors valid but waiting for all rows to load")
     
     def _load_input_rows(self):
         """Load all the input rows from CSR format"""
@@ -137,70 +166,82 @@ class ProcessingElement:
                 self._load_row(i)
                 break  # Load one row at a time to model pipeline behavior
         
-        if not loading_started and not self.pipeline_started:
+        if not loading_started:
             # All rows are loaded, check if we can start the pipeline
-            all_loaded = all(state['loaded'] for state in self.row_loading_state)
-            if all_loaded:
-                self.log("All rows loaded, starting pipeline")
-                self.pipeline_started = True
+            self._check_start_pipeline()
     
     def _load_row(self, row_idx):
-        """Load a single row from CSR format as blocks"""
+        """Load a row that may span multiple cache lines"""
         state = self.row_loading_state[row_idx]
         
-        # The addresses in state['col_indices_addr'] and state['values_addr'] 
-        # are already the correct starting addresses for this row, as calculated by the scheduler
-        # based on the row pointers
+        # Calculate current block address
+        block_index = state['current_block_index']
+        elements_per_block = self.cache_line_size
         
-        # Load the entire column indices block for this row in one shot
-        self.log(f"Loading column indices block from address {state['col_indices_addr']}")
+        # Calculate offsets for the current block
+        block_offset = block_index * elements_per_block
+        col_indices_block_addr = state['col_indices_addr'] + block_offset
+        values_block_addr = state['values_addr'] + block_offset
+        
+        self.log(f"Loading block {block_index+1}/{state['total_blocks']} for row {row_idx}")
+        
+        # Fetch column indices for this block
         if state['should_consume']:
-            col_idx_data, valid = self.fiber_cache.consume(state['col_indices_addr'])
+            col_idx_data, valid = self.fiber_cache.consume(col_indices_block_addr)
             if valid:
                 self.num_consumes += 1
         else:
-            col_idx_data, valid = self.fiber_cache.read(state['col_indices_addr'])
+            col_idx_data, valid = self.fiber_cache.read(col_indices_block_addr)
             if valid:
                 self.num_reads += 1
         
         if not valid:
-            # Need to wait for data
-            self.log(f"  Column indices block not ready, stalling")
+            self.log(f"  Column indices block at {col_indices_block_addr} not ready, stalling")
             self._stall(1, lambda: self._load_row(row_idx))
             return
         
-        state['col_indices'] = col_idx_data
-        self.log(f"  Loaded column indices block: {col_idx_data}")
-        
-        # Now load the values block for this row in one shot
-        self.log(f"Loading values block from address {state['values_addr']}")
+        # Fetch values for this block
         if state['should_consume']:
-            val_data, valid = self.fiber_cache.consume(state['values_addr'])
+            values_data, valid = self.fiber_cache.consume(values_block_addr)
             if valid:
                 self.num_consumes += 1
         else:
-            val_data, valid = self.fiber_cache.read(state['values_addr'])
+            values_data, valid = self.fiber_cache.read(values_block_addr)
             if valid:
                 self.num_reads += 1
         
         if not valid:
-            # Need to wait for data
-            self.log(f"  Values block not ready, stalling")
+            self.log(f"  Values block at {values_block_addr} not ready, stalling")
             self._stall(1, lambda: self._load_row(row_idx))
             return
         
-        state['values'] = val_data
-        self.log(f"  Loaded values block: {val_data}")
+        # Determine how many elements we actually need from this block
+        elements_remaining = (state['end_idx'] - state['start_idx']) - len(state['col_indices_collected'])
+        elements_in_block = min(len(col_idx_data), elements_remaining)
         
-        # Construct fiber from col indices and values
+        # Collect the data from this block
+        state['col_indices_collected'].extend(col_idx_data[:elements_in_block])
+        state['values_collected'].extend(values_data[:elements_in_block])
+        
+        self.log(f"  Collected {elements_in_block} elements from block {block_index+1}")
+        
+        # Move to next block if needed
+        state['current_block_index'] += 1
+        if state['current_block_index'] < state['total_blocks'] and len(state['col_indices_collected']) < (state['end_idx'] - state['start_idx']):
+            self.log(f"  More blocks needed for row {row_idx}, continuing to next block")
+            # Continue with the next block in the next cycle
+            return
+        
+        # All blocks for this row have been fetched
+        # Create the complete fiber
         fiber = []
-        for j in range(min(len(state['col_indices']), len(state['values']))):
-            fiber.append((state['col_indices'][j], state['values'][j]))
+        for j in range(len(state['col_indices_collected'])):
+            fiber.append((state['col_indices_collected'][j], state['values_collected'][j]))
         
         self.input_fibers[row_idx] = fiber
         state['loaded'] = True
         
-        self.log(f"Row {row_idx} loaded as a fiber: {fiber}")
+        self.log(f"Row {row_idx} fully loaded: {fiber}")
         
         # Continue loading other rows
         self._load_input_rows()
@@ -337,6 +378,7 @@ class ProcessingElement:
         """Complete the current task"""
         self.log(f"Task completed")
         self.idle = True
+        self.scaling_factors_valid = False  # Reset for next task
         
         if self.task_queue:
             self._start_next_task()
@@ -354,7 +396,7 @@ class ProcessingElement:
         
         if self.debug:
             self.log(f"--- TICK {self.total_cycles} ---")
-            self.log(f"  State: idle={self.idle}, stalled={self.stalled}, pipeline_started={self.pipeline_started}")
+            self.log(f"  State: idle={self.idle}, stalled={self.stalled}, pipeline_started={self.pipeline_started}, scaling_factors_valid={self.scaling_factors_valid}")
         
         if self.idle:
             if self.debug:
@@ -383,8 +425,8 @@ class ProcessingElement:
                 self.log(f"Still loading row data")
                 self._load_input_rows()
             else:
-                self.log(f"All rows loaded, starting pipeline")
-                self.pipeline_started = True
+                print("Load Complete")
+                self._check_start_pipeline()
     
     def get_stats(self):
         """Return statistics about PE operation"""
