@@ -7,8 +7,6 @@ class HBMChannel:
     def __init__(self, channel_id: int, bandwidth_gbps: float = 8.0, bus_width_bits: int = 64):
         self.channel_id = channel_id
         self.bandwidth_gbps = bandwidth_gbps
-        self.bus_width_bits = bus_width_bits
-        self.bus_width_bytes = bus_width_bits // 8
         
         # Convert bandwidth to bytes per cycle (assuming 1GHz clock)
         self.bytes_per_cycle = (bandwidth_gbps * 1e9) / (8 * 1e9)  # 8 bits per byte, 1GHz clock
@@ -49,7 +47,7 @@ class HBMChannel:
 
 class HBMMemory:
     """Simulates HBM memory with multiple channels and bandwidth constraints"""
-    def __init__(self, num_channels: int = 16, channel_bandwidth_gbps: float = 8.0, 
+    def __init__(self, num_channels: int = 16, channel_bandwidth_gbps: float = 12.0, 
                  bus_width_bits: int = 64, latency_cycles: int = 100):
         self.num_channels = num_channels
         self.channel_bandwidth_gbps = channel_bandwidth_gbps
@@ -71,6 +69,8 @@ class HBMMemory:
         self.outstanding_requests = {}
         self.request_latencies = {}
         self.next_request_id = 0
+
+        self.completed_request = []
         
         # Statistics
         self.stats = {
@@ -120,7 +120,7 @@ class HBMMemory:
     
     def tick(self) -> List[Dict]:
         """Simulate one memory cycle"""
-        completed_requests = []
+        self.completed_requests = []
         
         # Update cycle count
         self.stats['total_cycles'] += 1
@@ -154,17 +154,17 @@ class HBMMemory:
                 if request_id in self.outstanding_requests:
                     request = self.outstanding_requests[request_id]
                     self._complete_request(request)
-                    completed_requests.append(request)
+                    self.completed_requests.append(request)
                     del self.request_latencies[request_id]
         
-        return completed_requests
+        return self.completed_requests
     
     def _complete_request(self, request: Dict) -> None:
         """Complete a memory request"""
         if request['operation'] == 'read':
             # Simulate reading data
             if request['address'] not in self.memory_data:
-                request['data'] = f"data_at_{hex(request['address'])}"
+                request['data'] = 0 #f"data_at_{hex(request['address'])}"
             else:
                 request['data'] = self.memory_data[request['address']]
             
