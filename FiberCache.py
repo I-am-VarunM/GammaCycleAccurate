@@ -22,7 +22,7 @@ class CacheEntry:
 
 class FiberCache:
     def __init__(self, num_banks: int = 48, bank_size: int = 64*1024, 
-             associativity: int = 16, block_size: int = 64):
+             associativity: int = 16, block_size: int = 64, hbm_memory = None):
         self.num_banks = num_banks
         self.bank_size = bank_size
         self.associativity = associativity
@@ -59,8 +59,13 @@ class FiberCache:
         self.pending_queue = deque()
         
         # HBM memory instance
-        self.memory = HBMMemory(num_channels=16, channel_bandwidth_gbps=8.0, 
+        if hbm_memory:
+            print("HBM attached")
+            self.memory = hbm_memory
+        else:
+            self.memory = HBMMemory(num_channels=16, channel_bandwidth_gbps=8.0, 
                             bus_width_bits=64, latency_cycles=100)
+            print("Warning: Creating new HBM instance in FiberCache. This should ideally be shared.")
         
         # Statistics
         self.stats = {
@@ -80,42 +85,7 @@ class FiberCache:
             'offchip_bandwidth': 0,
             'bank_conflicts': 0
         }
-        
-        # Memory latency simulation
-        self.memory_latency = 100  # cycles
-        self.bus_width = 8  # bytes
-        
-    def _check_bank_conflict(self, bank_idx: int, operation: dict) -> bool:
-        """Check if bank is busy and queue operation if needed"""
-        if self.bank_busy[bank_idx]:
-            # Bank is busy, queue the operation
-            print("Hi")
-            self.bank_queue[bank_idx].append(operation)
-            self.stats['bank_conflicts'] += 1
-            return True
-        else:
-            # Bank is available, mark it as busy
-            self.bank_busy[bank_idx] = True
-            return False
     
-    def _release_bank(self, bank_idx: int):
-        """Release bank"""
-        #print("Hi")
-        #self.bank_busy[bank_idx] = False
-        self.banks_to_release.append(bank_idx)
-    
-    def _process_bank_operation(self, bank_idx: int, operation: dict):
-        """Process a bank operation"""
-        op_type = operation['type']
-        
-        if op_type == OperationType.READ:
-            return self._process_read_operation(bank_idx, operation)
-        elif op_type == OperationType.WRITE:
-            return self._process_write_operation(bank_idx, operation)
-        elif op_type == OperationType.FETCH:
-            return self._process_fetch_operation(bank_idx, operation)
-        elif op_type == OperationType.CONSUME:
-            return self._process_consume_operation(bank_idx, operation)
     
     def _get_bank_and_set(self, address: int) -> Tuple[int, int]:
         """Calculate bank and set index from address"""
@@ -187,7 +157,7 @@ class FiberCache:
     def read(self, address: int) -> Tuple[Optional[any], bool]:
         """Read operation - returns (data, valid)"""
         # Align address to block boundary
-        block_address = (address // self.block_size) * self.block_size
+        block_address = address
         bank_idx, set_idx = self._get_bank_and_set(block_address)
         
         # Check for bank conflict
@@ -265,40 +235,6 @@ class FiberCache:
         self.banks_to_release.append(bank_idx)
         return None, False
     
-    def _process_read_operation(self, bank_idx: int, operation: dict) -> Tuple[Optional[any], bool]:
-        """Process a read operation"""
-        address = operation['address']
-        set_idx = operation['set_idx']
-        cache_set = self.banks[bank_idx][set_idx]
-        
-        # Check for hit
-        for entry in cache_set:
-            if entry and entry.valid and entry.tag == address:
-                self._update_rrpv(entry)
-                self._update_priority(entry, OperationType.READ)
-                self.stats['read_hits'] += 1
-                self.stats['onchip_reads'] += 1
-                self.stats['onchip_bandwidth'] += self.block_size
-                self._release_bank(bank_idx)
-                return entry.data, True
-        
-        # Cache miss
-        self.stats['read_misses'] += 1
-        self.stats['offchip_reads'] += 1
-        self.stats['offchip_bandwidth'] += self.block_size
-        
-        # Initiate memory request
-        request_id = f"read_{address}_{self.stats['offchip_reads']}"
-        self.outstanding_requests[request_id] = {
-            'type': OperationType.READ,
-            'address': address,
-            'data': None
-        }
-        self.request_latency[request_id] = self.memory_latency
-        #print("Hi")
-        self._release_bank(bank_idx)
-        return None, False
-    
     def write(self, address: int, data: any) -> bool:
         """Write operation - returns success status"""
         bank_idx, set_idx = self._get_bank_and_set(address)
@@ -306,6 +242,10 @@ class FiberCache:
         # Check for bank conflict
         if self.bank_busy[bank_idx]:
             # Bank is busy, add to pending queue
+            for op in self.pending_queue:
+                if op['type'] == OperationType.WRITE and op['address'] == address:
+                    return None, False  # Already pending, ignore duplicate
+            print("bank busy during write, Adding to the pending queue")
             operation = {
                 'type': OperationType.WRITE,
                 'address': address,
@@ -357,46 +297,6 @@ class FiberCache:
         
         #self.bank_busy[bank_idx] = False  # Release bank
         self.banks_to_release.append(bank_idx)
-        return True
-    
-    def _process_write_operation(self, bank_idx: int, operation: dict) -> bool:
-        """Process a write operation"""
-        address = operation['address']
-        data = operation['data']
-        set_idx = operation['set_idx']
-        cache_set = self.banks[bank_idx][set_idx]
-        
-        # Check for hit
-        for entry in cache_set:
-            if entry and entry.valid and entry.tag == address:
-                self._update_rrpv(entry)
-                entry.data = data
-                entry.dirty = True
-                self.stats['write_hits'] += 1
-                self.stats['onchip_writes'] += 1
-                self.stats['onchip_bandwidth'] += self.block_size
-                self._release_bank(bank_idx)
-                return True
-        
-        # Cache miss - find victim
-        victim_idx = self._find_victim(bank_idx, set_idx)
-        
-        if cache_set[victim_idx] and cache_set[victim_idx].valid and cache_set[victim_idx].dirty:
-            # Write back dirty data
-            self.stats['offchip_writes'] += 1
-            self.stats['offchip_bandwidth'] += self.block_size
-        
-        # Allocate new entry with RRPV=2 (long re-reference interval) and priority=0
-        new_entry = CacheEntry(data, rrpv=2, priority=0)
-        new_entry.tag = address
-        new_entry.dirty = True
-        cache_set[victim_idx] = new_entry
-        
-        self.stats['write_misses'] += 1
-        self.stats['onchip_writes'] += 1
-        self.stats['onchip_bandwidth'] += self.block_size
-        
-        self._release_bank(bank_idx)
         return True
     
     def fetch(self, address: int) -> bool:
@@ -468,35 +368,6 @@ class FiberCache:
         self.banks_to_release.append(bank_idx)
         return True
     
-    def _process_fetch_operation(self, bank_idx: int, operation: dict) -> bool:
-        """Process a fetch operation"""
-        address = operation['address']
-        set_idx = operation['set_idx']
-        cache_set = self.banks[bank_idx][set_idx]
-        
-        # Check if already in cache
-        for entry in cache_set:
-            if entry and entry.valid and entry.tag == address:
-                self._update_priority(entry, OperationType.FETCH)
-                self._release_bank(bank_idx)
-                return True
-        
-        # Add to fetch queue if not in cache
-        self.fetch_queue.append(address)
-        self.stats['fetches'] += 1
-        
-        # Initiate fetch
-        request_id = f"fetch_{address}_{self.stats['fetches']}"
-        self.outstanding_requests[request_id] = {
-            'type': OperationType.FETCH,
-            'address': address,
-            'data': None
-        }
-        self.request_latency[request_id] = self.memory_latency
-        
-        self._release_bank(bank_idx)
-        return True
-    
     def consume(self, address: int) -> Tuple[Optional[any], bool]:
         """Consume operation - returns (data, valid)"""
         bank_idx, set_idx = self._get_bank_and_set(address)
@@ -559,61 +430,23 @@ class FiberCache:
         self.banks_to_release.append(bank_idx)
         return None, False
     
-    def _process_consume_operation(self, bank_idx: int, operation: dict) -> Tuple[Optional[any], bool]:
-        """Process a consume operation"""
-        address = operation['address']
-        set_idx = operation['set_idx']
-        cache_set = self.banks[bank_idx][set_idx]
-        
-        # Check for hit
-        for entry in cache_set:
-            if entry and entry.valid and entry.tag == address:
-                data = entry.data
-                entry.valid = False  # Invalidate
-                self.stats['consume_hits'] += 1
-                self.stats['consumes'] += 1
-                self.stats['onchip_bandwidth'] += self.block_size
-                self._release_bank(bank_idx)
-                return data, True
-        
-        # Cache miss
-        self.stats['consume_misses'] += 1
-        self.stats['consumes'] += 1
-        self.stats['offchip_reads'] += 1
-        self.stats['offchip_bandwidth'] += self.block_size
-        
-        request_id = f"consume_{address}_{self.stats['consumes']}"
-        self.outstanding_requests[request_id] = {
-            'type': OperationType.CONSUME,
-            'address': address,
-            'data': None
-        }
-        self.request_latency[request_id] = self.memory_latency
-        
-        self._release_bank(bank_idx)
-        return None, False
-    
     def tick(self) -> None:
         """Clock tick - update latencies and handle bank queues"""
-        # Tick the HBM memory
+        # Release banks that were busy in the previous cycle
         for bank_idx in self.banks_to_release:
             self.bank_busy[bank_idx] = False
         self.banks_to_release = []
         
+        # Tick the HBM memory
         completed_memory_requests = self.memory.tick()
-        
-        print(f"FiberCache tick: {len(completed_memory_requests)} completed memory requests")
-        print(f"Outstanding requests: {len(self.outstanding_requests)}")
-        print(f"Pending queue: {len(self.pending_queue)}")
-        
+        print("pending queue")
+        print(self.pending_queue)
         # Handle completed memory requests
         for mem_request in completed_memory_requests:
             if mem_request['id'] in self.outstanding_requests:
                 cache_request = self.outstanding_requests.pop(mem_request['id'])
                 address = cache_request['address']
                 data = mem_request['data']
-                
-                print(f"  Completed request for address {address}, type: {cache_request.get('type', 'unknown')}")
                 
                 # Insert data into cache
                 bank_idx, set_idx = self._get_bank_and_set(address)
@@ -640,7 +473,7 @@ class FiberCache:
         for i, operation in enumerate(list(self.pending_queue)):
             op_type = operation['type']
             address = operation['address']
-            bank_idx, set_idx = self._get_bank_and_set(address)
+            bank_idx = operation.get('bank_idx', self._get_bank_and_set(address)[0])
             
             # Check if bank is available
             if not self.bank_busy[bank_idx]:
@@ -650,20 +483,48 @@ class FiberCache:
                 # Process operation based on type
                 if op_type == OperationType.READ:
                     # Re-execute read operation
-                    self.read(operation['address'])
+                    self.read(address)
                 elif op_type == OperationType.WRITE:
-                    # Re-execute write operation
-                    self.write(operation['address'], operation['data'])
+                    # Re-execute write operation  
+                    self.write(address, operation['data'])
                 elif op_type == OperationType.FETCH:
                     # Re-execute fetch operation
-                    self.fetch(operation['address'])
+                    self.fetch(address)
                 elif op_type == OperationType.CONSUME:
                     # Re-execute consume operation
-                    self.consume(operation['address'])
+                    self.consume(address)
         
-        # Remove processed operations from pending queue
-        for i in sorted(processed_operations, reverse=True):
-            self.pending_queue.pop(i)
+            # Process pending queue - create a new queue for operations still pending
+        new_pending_queue = deque()
+        
+        # Process each operation in the current pending queue
+        while self.pending_queue:
+            operation = self.pending_queue.popleft()
+            op_type = operation['type']
+            address = operation['address']
+            bank_idx = operation.get('bank_idx', self._get_bank_and_set(address)[0])
+            
+            # Check if bank is available
+            if not self.bank_busy[bank_idx]:
+                # Process operation based on type
+                if op_type == OperationType.READ:
+                    # Re-execute read operation
+                    self.read(address)
+                elif op_type == OperationType.WRITE:
+                    # Re-execute write operation  
+                    self.write(address, operation['data'])
+                elif op_type == OperationType.FETCH:
+                    # Re-execute fetch operation
+                    self.fetch(address)
+                elif op_type == OperationType.CONSUME:
+                    # Re-execute consume operation
+                    self.consume(address)
+            else:
+                # Bank still busy, add back to pending queue
+                new_pending_queue.append(operation)
+        
+        # Update pending queue with operations that couldn't be processed
+        self.pending_queue = new_pending_queue
         
         # Bank queues are no longer needed since we handle bank conflicts directly in operations
     
