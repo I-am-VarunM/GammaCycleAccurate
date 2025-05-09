@@ -1,227 +1,739 @@
-from ModifiedIntegrateGammaPE import ProcessingElement
-from FiberCache import FiberCache
-class GammaCluster:
-    def __init__(self, num_pes=32, radix=64, fiber_cache=None):
-        """Initialize a GammaCluster with a scheduler and multiple PEs
+class GammaScheduler:
+    def __init__(self, hbm_memory, fiber_cache, num_pes=32, pe_radix=64, debug=True):
+        """Initialize the Gamma Scheduler
         
         Args:
-            num_pes: Number of Processing Elements
-            radix: Radix of each PE merger (max number of fibers to merge in a single pass)
-            fiber_cache: Optional FiberCache instance to use. If None, creates a new one
+            hbm_memory: HBM memory instance
+            fiber_cache: FiberCache instance
+            num_pes: Number of processing elements available
+            pe_radix: Radix of each PE (max number of inputs it can merge)
+            debug: Enable debug output
         """
-        # Use provided FiberCache or create new one
-        self.fiber_cache = fiber_cache if fiber_cache else FiberCache(
-            num_banks=48, bank_size=64*1024, associativity=16, block_size=64)
+        self.hbm_memory = hbm_memory
+        self.fiber_cache = fiber_cache
+        self.num_pes = num_pes
+        self.pe_radix = pe_radix
+        self.debug = debug
         
-        # Create the PEs with the updated PE class for CSR format
+        # References to PE instances (to be set later)
         self.pes = []
-        for pe_id in range(num_pes):
-            pe = ProcessingElement(pe_id=pe_id, radix=radix, debug=True)
-            pe.set_fiber_cache(self.fiber_cache)
-            self.pes.append(pe)
         
-        # Initialize scheduler state
-        self.radix = radix
-        self.pending_tasks = []  # Queue of tasks to be processed
-        self.total_cycles = 0
+        # Current matrix being processed
+        self.matrix_a_base_addr = None
+        self.matrix_a_rows = None
+        self.matrix_b_base_addr = None
+        self.matrix_b_cols = None
+        self.output_matrix_base_addr = None
         
-        # Stats
+        # Task tracking
+        self.next_task_id = 0
+        self.next_row_to_schedule = 0
+        self.rows_completed = 0
+        self.total_rows = 0
+        
+        # Task scoreboard - main data structure for tracking tasks
+        self.scoreboard = {}  # task_id -> task_info
+        self.pending_tasks = []  # Tasks ready to be dispatched
+        self.running_tasks = {}  # pe_id -> task_id
+        self.completed_tasks = []  # List of completed task IDs
+        
+        # CSR row pointers - needed to determine row sizes
+        self.rowptr_a = None
+        self.rowptr_a_addr = None
+        self.rowptr_a_request_id = None
+        self.rowptr_a_loaded = False
+        
+        # Task tree tracking
+        self.task_tree = {}  # row_id -> list of task nodes
+        
+        # Partial output tracking
+        self.partial_outputs = {}  # (row_id, level, node_idx) -> addr
+        self.next_partial_output_addr = None
+        
+        # Memory request tracking
+        self.outstanding_requests = {}  # request_id -> info
+        
+        # PE state tracking
+        self.pe_ready = [True] * num_pes  # Whether each PE is ready for a new task
+        
+        # Statistics
+        self.cycles = 0
         self.stats = {
-            'total_cycles': 0,
-            'pe_utilization': 0,
-            'memory_accesses': 0
+            'tasks_created': 0,
+            'tasks_dispatched': 0,
+            'tasks_completed': 0,
+            'memory_requests': 0,
+            'idle_cycles': 0,
+            'active_cycles': 0,
+            'a_rows_loaded': 0,
+            'b_rows_loaded': 0,
         }
+        
+        # Debug log
+        self.debug_log = []
     
-    def schedule_task(self, task):
-        """Schedule a CSR-based task for execution
+    def log(self, message):
+        """Add a message to the debug log"""
+        if self.debug:
+            self.debug_log.append(f"Cycle {self.cycles}: {message}")
+            print(f"Scheduler - Cycle {self.cycles}: {message}")
+    
+    def set_pes(self, pes):
+        """Set the list of PE instances
         
         Args:
-            task: Task specification for CSR format
-                - input_row_data: List of tuples (col_indices_addr, values_addr, start_idx, end_idx)
-                - input_consume_flags: List of booleans for consuming inputs
-                - scaling_factors: List of scaling factors for inputs
-                - output_col_indices_addr: Address for output column indices
-                - output_values_addr: Address for output values
+            pes: List of ProcessingElement instances
         """
-        print(f"Scheduling task with {len(task['input_row_data'])} input rows")
-        print(f"  Output addresses: col_indices={task['output_col_indices_addr']}, values={task['output_values_addr']}")
-        
-        # Check if task needs to be decomposed (if number of inputs exceeds PE radix)
-        if len(task['input_row_data']) <= self.radix:
-            # Simple case: assign directly to a PE
-            self.pending_tasks.append(task)
-        else:
-            # Complex case: break into multiple tasks
-            print(f"  Task has {len(task['input_row_data'])} inputs, decomposing")
-            subtasks = self._decompose_task(task)
-            self.pending_tasks.extend(subtasks)
+        self.pes = pes
+        if len(pes) != self.num_pes:
+            self.log(f"Warning: Expected {self.num_pes} PEs, got {len(pes)}")
+            self.num_pes = len(pes)
+            self.pe_ready = [True] * self.num_pes
     
-    def _decompose_task(self, task):
-        """Break a large task into smaller ones that fit within PE radix
+    def set_matrix_operation(self, matrix_a_base_addr, matrix_a_rows, 
+                            matrix_b_base_addr, matrix_b_cols,
+                            output_matrix_base_addr, rowptr_a_addr):
+        """Set the matrix operation to be performed
         
         Args:
-            task: Original task with input_row_data exceeding radix
+            matrix_a_base_addr: Base address of matrix A
+            matrix_a_rows: Number of rows in matrix A
+            matrix_b_base_addr: Base address of matrix B
+            matrix_b_cols: Number of columns in matrix B
+            output_matrix_base_addr: Base address for the output matrix
+            rowptr_a_addr: Address of the row pointers for matrix A
+        """
+        self.matrix_a_base_addr = matrix_a_base_addr
+        self.matrix_a_rows = matrix_a_rows
+        self.matrix_b_base_addr = matrix_b_base_addr
+        self.matrix_b_cols = matrix_b_cols
+        self.output_matrix_base_addr = output_matrix_base_addr
+        self.rowptr_a_addr = rowptr_a_addr
+        
+        # Reset scheduling state
+        self.next_row_to_schedule = 0
+        self.rows_completed = 0
+        self.total_rows = matrix_a_rows
+        self.next_task_id = 0
+        self.scoreboard = {}
+        self.pending_tasks = []
+        self.running_tasks = {}
+        self.completed_tasks = []
+        self.task_tree = {}
+        self.partial_outputs = {}
+        self.next_partial_output_addr = output_matrix_base_addr + (matrix_a_rows * 2 * 4)  # Assuming 4 bytes per element
+        
+        # Request row pointers for matrix A
+        self.rowptr_a_loaded = False
+        self.rowptr_a_request_id = self.hbm_memory.read(rowptr_a_addr, (matrix_a_rows + 1) * 4)  # Assuming 4 bytes per pointer
+        self.outstanding_requests[self.rowptr_a_request_id] = {
+            'type': 'rowptr_a',
+            'addr': rowptr_a_addr,
+            'size': (matrix_a_rows + 1) * 4
+        }
+        self.log(f"Requested row pointers for matrix A from address {rowptr_a_addr}")
+    
+    def _create_task_tree(self, row_id, nonzeros):
+        """Create a task tree for a row with more nonzeros than the PE radix
+        
+        Args:
+            row_id: The row ID in matrix A
+            nonzeros: The number of nonzeros in the row
             
         Returns:
-            List of subtasks that collectively perform the original task
+            A list of tasks organized in a tree structure
         """
-        # Temporary addresses for partial outputs
-        next_temp_col_indices_addr = 20000  # Start temp addresses at 20000
-        next_temp_values_addr = 30000
+        self.log(f"Creating task tree for row {row_id} with {nonzeros} nonzeros")
         
-        # Gather input data
-        inputs = task['input_row_data']
-        scaling_factors = task['scaling_factors']
+        # Calculate the number of leaf tasks needed
+        num_leaf_tasks = (nonzeros + self.pe_radix - 1) // self.pe_radix
         
-        # Group inputs into chunks of radix size
-        chunks = []
-        for i in range(0, len(inputs), self.radix):
-            chunk = inputs[i:i+self.radix]
-            chunks.append(chunk)
+        # Calculate tree height
+        height = 1
+        nodes_at_level = num_leaf_tasks
+        while nodes_at_level > 1:
+            nodes_at_level = (nodes_at_level + self.pe_radix - 1) // self.pe_radix
+            height += 1
         
-        print(f"  Created {len(chunks)} chunks")
+        self.log(f"Task tree height: {height}, leaf tasks: {num_leaf_tasks}")
         
-        # Create leaf tasks
-        subtasks = []
-        partial_outputs = []
+        # Initialize task tree structure
+        tree = [[] for _ in range(height)]
         
-        for i, chunk in enumerate(chunks):
-            # Assign temp addresses for this partial output
-            temp_col_indices_addr = next_temp_col_indices_addr
-            temp_values_addr = next_temp_values_addr
-            next_temp_col_indices_addr += self.radix
-            next_temp_values_addr += self.radix
+        # Create leaf tasks (level 0)
+        for leaf_idx in range(num_leaf_tasks):
+            start_nonzero = leaf_idx * self.pe_radix
+            end_nonzero = min((leaf_idx + 1) * self.pe_radix, nonzeros)
             
-            # Create subtask for this chunk
-            chunk_scaling_factors = scaling_factors[i*self.radix:(i+1)*self.radix]
-            chunk_consume_flags = [False] * len(chunk)  # Don't consume inputs
-            
-            subtask = {
-                "input_row_data": chunk,
-                "input_consume_flags": chunk_consume_flags,
-                "scaling_factors": chunk_scaling_factors,
-                "output_col_indices_addr": temp_col_indices_addr,
-                "output_values_addr": temp_values_addr
+            leaf_task = {
+                'level': 0,
+                'node_idx': leaf_idx,
+                'start_nonzero': start_nonzero,
+                'end_nonzero': end_nonzero,
+                'input_tasks': [],  # Leaf tasks have no input tasks
+                'output_task': None,  # Will be filled in later
+                'task_id': None,  # Will be assigned when scheduled
+                'completed': False
             }
             
-            subtasks.append(subtask)
-            partial_outputs.append((temp_col_indices_addr, temp_values_addr))
+            tree[0].append(leaf_task)
         
-        # Create merge tasks for partial outputs if needed
-        while len(partial_outputs) > 1:
-            new_partial_outputs = []
+        # Create internal nodes
+        for level in range(1, height):
+            prev_level_nodes = len(tree[level-1])
+            nodes_this_level = (prev_level_nodes + self.pe_radix - 1) // self.pe_radix
             
-            for i in range(0, len(partial_outputs), self.radix):
-                chunk = partial_outputs[i:i+self.radix]
+            for node_idx in range(nodes_this_level):
+                start_child = node_idx * self.pe_radix
+                end_child = min((node_idx + 1) * self.pe_radix, prev_level_nodes)
                 
-                # If this is the final merge and it's the only one, output to original destination
-                if i + self.radix >= len(partial_outputs) and len(new_partial_outputs) == 0:
-                    out_col_indices_addr = task['output_col_indices_addr']
-                    out_values_addr = task['output_values_addr']
-                else:
-                    # Otherwise, create new temp addresses
-                    out_col_indices_addr = next_temp_col_indices_addr
-                    out_values_addr = next_temp_values_addr
-                    next_temp_col_indices_addr += self.radix
-                    next_temp_values_addr += self.radix
+                # List of child tasks that feed into this node
+                input_tasks = tree[level-1][start_child:end_child]
                 
-                # Create the merge task
-                input_row_data = []
-                for col_addr, val_addr in chunk:
-                    # For partial outputs, we use the whole array (no start/end indices)
-                    input_row_data.append((col_addr, val_addr, 0, self.radix))
-                
-                merge_task = {
-                    "input_row_data": input_row_data,
-                    "input_consume_flags": [True] * len(chunk),  # Consume partial outputs
-                    "scaling_factors": [1.0] * len(chunk),       # No scaling for merges
-                    "output_col_indices_addr": out_col_indices_addr,
-                    "output_values_addr": out_values_addr
+                # Create the node
+                node_task = {
+                    'level': level,
+                    'node_idx': node_idx,
+                    'input_tasks': input_tasks,
+                    'output_task': None,  # Will be filled in for non-root nodes
+                    'task_id': None,  # Will be assigned when scheduled
+                    'completed': False
                 }
                 
-                subtasks.append(merge_task)
-                new_partial_outputs.append((out_col_indices_addr, out_values_addr))
-            
-            partial_outputs = new_partial_outputs
+                # Set the output task of all child nodes
+                for child in input_tasks:
+                    child['output_task'] = node_task
+                
+                tree[level].append(node_task)
         
-        print(f"  Created {len(subtasks)} subtasks")
-        return subtasks
+        # Store the task tree
+        self.task_tree[row_id] = tree
+        
+        return tree
     
-    def tick(self):
-        """Process one cycle of the GammaCluster
+    def _can_schedule_task(self, task):
+        """Check if a task can be scheduled based on its dependencies
+        
+        Args:
+            task: The task to check
+            
+        Returns:
+            bool: True if the task can be scheduled, False otherwise
+        """
+        # Leaf tasks can always be scheduled
+        if task['level'] == 0:
+            return True
+        
+        # For non-leaf tasks, all input tasks must be completed
+        return all(input_task['completed'] for input_task in task['input_tasks'])
+    
+    def _find_ready_task(self):
+        """Find a task that is ready to be scheduled
         
         Returns:
-            True if there is still work to do, False if all work is complete
+            The highest priority task that is ready, or None if no tasks are ready
         """
-        self.total_cycles += 1
-        
-        # Tick the FiberCache
-        self.fiber_cache.tick()
-        
-        # Assign tasks to idle PEs
-        self._assign_tasks()
-        
-        # Tick all PEs
-        for pe in self.pes:
-            #print("Happening")
-            pe.tick()
-        
-        # Check if all work is complete
-        if not self.pending_tasks and all(pe.idle for pe in self.pes):
-            return False  # All work is complete
-        
-        return True  # More work to do
-    
-    def _assign_tasks(self):
-        """Assign pending tasks to idle PEs"""
-        # Find idle PEs
-        idle_pes = [pe for pe in self.pes if pe.idle]
-        
-        # Assign pending tasks to idle PEs
-        while idle_pes and self.pending_tasks:
-            pe = idle_pes.pop(0)
-            task = self.pending_tasks.pop(0)
-            pe.assign_task(task)
-    
-    def run_until_complete(self, max_cycles=10000):
-        """Run the GammaCluster until all work is complete or max_cycles is reached"""
-        print("\n=== Starting GammaCluster execution ===")
-        print(f"Pending tasks: {len(self.pending_tasks)}")
-        print(f"PE states: {['idle' if pe.idle else 'busy' for pe in self.pes]}")
-        
-        for cycle in range(max_cycles):
-            print(f"\n----- CYCLE {cycle+1} -----")
-            if not self.tick():
-                print(f"Completed in {cycle+1} cycles")
-                print(f"Final PE states: {['idle' if pe.idle else 'busy' for pe in self.pes]}")
-                self.stats['total_cycles'] = cycle+1
-                return cycle+1
+        # First, check for leaf tasks for new rows
+        if self.next_row_to_schedule < self.total_rows and self.rowptr_a_loaded:
+            row_id = self.next_row_to_schedule
+            row_nnz = self.rowptr_a[row_id + 1] - self.rowptr_a[row_id]
+            
+            # If this row fits in a single PE, create a simple task
+            if row_nnz <= self.pe_radix:
+                # Create a simple task for this row
+                task = self._create_simple_task(row_id, row_nnz)
+                self.pending_tasks.append(task)
+                self.next_row_to_schedule += 1
+                return task
+            else:
+                # Create a task tree for this row if not already created
+                if row_id not in self.task_tree:
+                    self._create_task_tree(row_id, row_nnz)
                 
-            # Print state after each cycle
-            if cycle < 10 or cycle % 10 == 0:  # Print first 10 cycles, then every 10th
-                active_pes = sum(1 for pe in self.pes if not pe.idle)
-                print(f"  Active PEs: {active_pes}/{len(self.pes)}")
-                print(f"  Pending tasks: {len(self.pending_tasks)}")
-                print(f"  FiberCache stats: {self.fiber_cache.stats['read_hits']} hits, {self.fiber_cache.stats['read_misses']} misses")
+                # Find leaf tasks that are ready
+                for leaf_task in self.task_tree[row_id][0]:
+                    if leaf_task['task_id'] is None:  # Not yet scheduled
+                        task = self._create_task_from_node(row_id, leaf_task)
+                        self.pending_tasks.append(task)
+                        return task
+                
+                # If all leaf tasks are scheduled, check for internal nodes
+                for level in range(1, len(self.task_tree[row_id])):
+                    for node in self.task_tree[row_id][level]:
+                        if node['task_id'] is None and self._can_schedule_task(node):
+                            task = self._create_task_from_node(row_id, node)
+                            self.pending_tasks.append(task)
+                            return task
+                
+                # If all tasks for this row are scheduled, move to next row
+                all_scheduled = True
+                for level in self.task_tree[row_id]:
+                    for node in level:
+                        if node['task_id'] is None:
+                            all_scheduled = False
+                            break
+                    if not all_scheduled:
+                        break
+                
+                if all_scheduled:
+                    self.next_row_to_schedule += 1
+                
+                # If no new tasks for this row, check existing pending tasks
+                if self.pending_tasks:
+                    return self.pending_tasks[0]
+                
+                # Try scheduling from the next row
+                return self._find_ready_task()
         
-        print(f"Warning: Reached maximum cycle count ({max_cycles})")
-        self.stats['total_cycles'] = max_cycles
-        return max_cycles
+        # If we have pending tasks, return the highest priority one
+        if self.pending_tasks:
+            # Priority: higher level tasks first (to reduce partial output footprint)
+            highest_priority = None
+            for task in self.pending_tasks:
+                if 'node' in task and task['node']['level'] > 0:
+                    if highest_priority is None or task['node']['level'] > highest_priority['node']['level']:
+                        highest_priority = task
+            
+            # If no high-priority tasks, return the first one
+            return highest_priority if highest_priority else self.pending_tasks[0]
+        
+        return None
+    
+    def _create_simple_task(self, row_id, nnz):
+        """Create a simple task for a row that fits in a single PE
+        
+        Args:
+            row_id: The row ID in matrix A
+            nnz: The number of nonzeros in the row
+            
+        Returns:
+            A task dictionary ready to be assigned to a PE
+        """
+        task_id = self.next_task_id
+        self.next_task_id += 1
+        
+        # Calculate addresses for this row
+        a_row_addr = self.matrix_a_base_addr + self.rowptr_a[row_id] * 4  # Assuming 4 bytes per element
+        output_row_addr = self.output_matrix_base_addr + row_id * 2 * 4  # Assuming 4 bytes per element
+        
+        # Create the task
+        task = {
+            'id': task_id,
+            'type': 'simple',
+            'row_id': row_id,
+            'input_row_data': [],  # Will be filled with B rows
+            'scaling_factors': [],  # Will be filled with A values
+            'output_col_indices_addr': output_row_addr,
+            'output_values_addr': output_row_addr + self.matrix_b_cols * 4,  # Assuming 4 bytes per element
+            'a_row_addr': a_row_addr,
+            'a_row_nnz': nnz,
+            'a_row_loaded': False,
+            'a_row_request_id': None,
+            'ready': False  # Will be set to True when A row is loaded
+        }
+        
+        # Add to scoreboard
+        self.scoreboard[task_id] = task
+        
+        # Request A row
+        a_row_request_id = self.hbm_memory.read(a_row_addr, nnz * 4)  # Assuming 4 bytes per element
+        task['a_row_request_id'] = a_row_request_id
+        self.outstanding_requests[a_row_request_id] = {
+            'type': 'a_row',
+            'task_id': task_id,
+            'addr': a_row_addr,
+            'size': nnz * 4
+        }
+        self.log(f"Requested A row {row_id} from address {a_row_addr}")
+        
+        return task
+    
+    def _create_task_from_node(self, row_id, node):
+        """Create a task from a node in the task tree
+        
+        Args:
+            row_id: The row ID in matrix A
+            node: The node in the task tree
+            
+        Returns:
+            A task dictionary ready to be assigned to a PE
+        """
+        task_id = self.next_task_id
+        self.next_task_id += 1
+        node['task_id'] = task_id
+        
+        # Determine if this is a root task
+        is_root = (node['level'] == len(self.task_tree[row_id]) - 1)
+        
+        # Calculate output address
+        output_addr = None
+        if is_root:
+            # Root node outputs to the final result matrix
+            output_addr = self.output_matrix_base_addr + row_id * 2 * 4  # Assuming 4 bytes per element
+        else:
+            # Internal node outputs to a temporary location
+            output_key = (row_id, node['level'], node['node_idx'])
+            if output_key not in self.partial_outputs:
+                self.partial_outputs[output_key] = self.next_partial_output_addr
+                self.next_partial_output_addr += self.matrix_b_cols * 4 * 2  # Space for indices and values
+            
+            output_addr = self.partial_outputs[output_key]
+        
+        # Create the task
+        task = {
+            'id': task_id,
+            'type': 'tree_node',
+            'row_id': row_id,
+            'node': node,
+            'input_row_data': [],  # Will be filled based on level
+            'scaling_factors': [],  # Will be filled when dispatched
+            'output_col_indices_addr': output_addr,
+            'output_values_addr': output_addr + self.matrix_b_cols * 4,  # Assuming 4 bytes per element
+            'ready': False  # Will be set to True when inputs are ready
+        }
+        
+        # For leaf nodes, we need A row values
+        if node['level'] == 0:
+            # Calculate A row segment
+            a_start = self.rowptr_a[row_id] + node['start_nonzero']
+            a_end = self.rowptr_a[row_id] + node['end_nonzero']
+            a_row_addr = self.matrix_a_base_addr + a_start * 4  # Assuming 4 bytes per element
+            a_row_nnz = a_end - a_start
+            
+            task['a_row_addr'] = a_row_addr
+            task['a_row_nnz'] = a_row_nnz
+            task['a_row_loaded'] = False
+            
+            # Request A row segment
+            a_row_request_id = self.hbm_memory.read(a_row_addr, a_row_nnz * 4)  # Assuming 4 bytes per element
+            task['a_row_request_id'] = a_row_request_id
+            self.outstanding_requests[a_row_request_id] = {
+                'type': 'a_row',
+                'task_id': task_id,
+                'addr': a_row_addr,
+                'size': a_row_nnz * 4
+            }
+            self.log(f"Requested A row {row_id} segment [{a_start}:{a_end}] from address {a_row_addr}")
+        
+        # For internal nodes, inputs come from child tasks
+        else:
+            task['input_tasks'] = []
+            for input_task in node['input_tasks']:
+                input_task_id = input_task['task_id']
+                if input_task_id is not None:
+                    task['input_tasks'].append(input_task_id)
+            
+            # Check if all input tasks are completed
+            if all(task_id in self.completed_tasks for task_id in task['input_tasks']):
+                task['ready'] = True
+        
+        # Add to scoreboard
+        self.scoreboard[task_id] = task
+        
+        return task
+    
+    def _dispatch_task_to_pe(self, pe_id, task):
+        """Dispatch a task to a PE
+        
+        Args:
+            pe_id: The ID of the PE to dispatch to
+            task: The task to dispatch
+        """
+        # Mark PE as busy
+        self.pe_ready[pe_id] = False
+        
+        # Mark task as running
+        task['status'] = 'running'
+        task['pe_id'] = pe_id
+        self.running_tasks[pe_id] = task['id']
+        
+        # Remove from pending tasks
+        if task in self.pending_tasks:
+            self.pending_tasks.remove(task)
+        
+        # Prepare input data
+        if task['type'] == 'simple' and task['a_row_loaded']:
+            # A simple task needs B rows corresponding to A row nonzeros
+            a_row_nnz = task['a_row_nnz']
+            scaling_factors = task['a_row_values']
+            input_row_data = []
+            
+            # For each nonzero in A, we need the corresponding B row
+            for i in range(a_row_nnz):
+                col_idx = task['a_row_indices'][i]
+                b_row_addr = self.matrix_b_base_addr + self.rowptr_a[col_idx] * 4  # Assuming 4 bytes per element
+                b_row_size = self.rowptr_a[col_idx + 1] - self.rowptr_a[col_idx]
+                
+                input_row_data.append((b_row_addr, b_row_addr + b_row_size * 4, 0, b_row_size))
+            
+            # Create the PE task
+            pe_task = {
+                'input_row_data': input_row_data,
+                'scaling_factors': scaling_factors,
+                'output_col_indices_addr': task['output_col_indices_addr'],
+                'output_values_addr': task['output_values_addr']
+            }
+            
+            # Assign task to PE
+            self.pes[pe_id].assign_task(pe_task)
+            
+            # Send scaling factors to PE
+            self.pes[pe_id].set_scaling_factors(scaling_factors)
+            
+            self.log(f"Dispatched simple task {task['id']} for row {task['row_id']} to PE {pe_id}")
+            self.stats['tasks_dispatched'] += 1
+        
+        elif task['type'] == 'tree_node' and task['ready']:
+            if task['node']['level'] == 0:
+                # Leaf node in task tree - needs B rows corresponding to A segment
+                a_row_nnz = task['a_row_nnz']
+                scaling_factors = task['a_row_values']
+                input_row_data = []
+                
+                # For each nonzero in the A segment, we need the corresponding B row
+                for i in range(a_row_nnz):
+                    col_idx = task['a_row_indices'][i]
+                    b_row_addr = self.matrix_b_base_addr + self.rowptr_a[col_idx] * 4  # Assuming 4 bytes per element
+                    b_row_size = self.rowptr_a[col_idx + 1] - self.rowptr_a[col_idx]
+                    
+                    input_row_data.append((b_row_addr, b_row_addr + b_row_size * 4, 0, b_row_size))
+                
+                # Create the PE task
+                pe_task = {
+                    'input_row_data': input_row_data,
+                    'scaling_factors': scaling_factors,
+                    'output_col_indices_addr': task['output_col_indices_addr'],
+                    'output_values_addr': task['output_values_addr']
+                }
+                
+                # Assign task to PE
+                self.pes[pe_id].assign_task(pe_task)
+                
+                # Send scaling factors to PE
+                self.pes[pe_id].set_scaling_factors(scaling_factors)
+                
+                self.log(f"Dispatched leaf tree node task {task['id']} for row {task['row_id']} to PE {pe_id}")
+                self.stats['tasks_dispatched'] += 1
+            
+            else:
+                # Internal node in task tree - needs partial results from child tasks
+                input_row_data = []
+                scaling_factors = []
+                
+                # For each input task, add its output as an input
+                for i, input_task_id in enumerate(task['input_tasks']):
+                    input_task = self.scoreboard[input_task_id]
+                    input_addr = input_task['output_col_indices_addr']
+                    
+                    # We don't know the size of the partial output, so use a large value
+                    # In a real implementation, we would track sizes of partial outputs
+                    input_size = self.matrix_b_cols  # Estimate
+                    
+                    input_row_data.append((input_addr, input_addr + input_size * 4, 0, input_size))
+                    scaling_factors.append(1.0)  # Scale factor is 1.0 for partial outputs
+                
+                # Create the PE task
+                pe_task = {
+                    'input_row_data': input_row_data,
+                    'scaling_factors': scaling_factors,
+                    'output_col_indices_addr': task['output_col_indices_addr'],
+                    'output_values_addr': task['output_values_addr']
+                }
+                
+                # Assign task to PE
+                self.pes[pe_id].assign_task(pe_task)
+                
+                # Send scaling factors to PE
+                self.pes[pe_id].set_scaling_factors(scaling_factors)
+                
+                self.log(f"Dispatched internal tree node task {task['id']} for row {task['row_id']} to PE {pe_id}")
+                self.stats['tasks_dispatched'] += 1
+        
+        else:
+            self.log(f"Warning: Tried to dispatch task {task['id']} but it's not ready")
+            # Put PE back in ready state
+            self.pe_ready[pe_id] = True
+            # Remove from running tasks
+            if pe_id in self.running_tasks:
+                del self.running_tasks[pe_id]
+    
+    def _handle_task_completion(self, pe_id):
+        """Handle completion of a task on a PE
+        
+        Args:
+            pe_id: The ID of the PE that completed a task
+        """
+        if pe_id in self.running_tasks:
+            task_id = self.running_tasks[pe_id]
+            task = self.scoreboard[task_id]
+            
+            # Mark task as completed
+            task['status'] = 'completed'
+            self.completed_tasks.append(task_id)
+            
+            self.log(f"Task {task_id} completed on PE {pe_id}")
+            self.stats['tasks_completed'] += 1
+            
+            # If this is a tree node, mark the node as completed
+            if task['type'] == 'tree_node':
+                task['node']['completed'] = True
+                
+                # Check if this completes the row
+                row_id = task['row_id']
+                if task['node']['level'] == len(self.task_tree[row_id]) - 1:
+                    self.rows_completed += 1
+                    self.log(f"Row {row_id} completed, {self.rows_completed}/{self.total_rows} rows done")
+            
+            elif task['type'] == 'simple':
+                # Simple task completes the row directly
+                self.rows_completed += 1
+                self.log(f"Row {task['row_id']} completed, {self.rows_completed}/{self.total_rows} rows done")
+            
+            # Remove from running tasks
+            del self.running_tasks[pe_id]
+            
+            # Mark PE as ready for new tasks
+            self.pe_ready[pe_id] = True
+    
+    def _update_ready_tasks(self):
+        """Update the ready status of tasks based on completed dependencies"""
+        for task_id, task in self.scoreboard.items():
+            # Skip tasks that are already ready, running, or completed
+            if task.get('ready', False) or task.get('status') in ['running', 'completed']:
+                continue
+            
+            if task['type'] == 'simple':
+                # Simple task is ready when A row is loaded
+                if task['a_row_loaded']:
+                    task['ready'] = True
+                    if task not in self.pending_tasks:
+                        self.pending_tasks.append(task)
+            
+            elif task['type'] == 'tree_node':
+                if task['node']['level'] == 0:
+                    # Leaf node is ready when A row segment is loaded
+                    if task.get('a_row_loaded', False):
+                        task['ready'] = True
+                        if task not in self.pending_tasks:
+                            self.pending_tasks.append(task)
+                
+                else:
+                    # Internal node is ready when all input tasks are completed
+                    all_inputs_ready = True
+                    for input_task_id in task['input_tasks']:
+                        if input_task_id not in self.completed_tasks:
+                            all_inputs_ready = False
+                            break
+                    
+                    if all_inputs_ready:
+                        task['ready'] = True
+                        if task not in self.pending_tasks:
+                            self.pending_tasks.append(task)
+    
+    def _handle_memory_response(self, request):
+        """Handle a memory response
+        
+        Args:
+            request: The memory request that completed
+        """
+        request_id = request['id']
+        
+        if request_id in self.outstanding_requests:
+            req_info = self.outstanding_requests[request_id]
+            
+            if req_info['type'] == 'rowptr_a':
+                # Row pointers for matrix A
+                self.rowptr_a = request['data']
+                self.rowptr_a_loaded = True
+                self.log(f"Loaded row pointers for matrix A: {self.rowptr_a}")
+            
+            elif req_info['type'] == 'a_row':
+                # A row or A row segment
+                task_id = req_info['task_id']
+                if task_id in self.scoreboard:
+                    task = self.scoreboard[task_id]
+                    
+                    # Parse the A row data into indices and values
+                    # In a real implementation, we would need to handle the format correctly
+                    # Assuming alternating indices and values in the data
+                    data = request['data']
+                    indices = []
+                    values = []
+                    for i in range(0, len(data), 2):
+                        indices.append(data[i])
+                        values.append(data[i+1])
+                    
+                    task['a_row_indices'] = indices
+                    task['a_row_values'] = values
+                    task['a_row_loaded'] = True
+                    
+                    # Update task readiness
+                    if not task.get('ready', False):
+                        task['ready'] = True
+                        if task not in self.pending_tasks:
+                            self.pending_tasks.append(task)
+                    
+                    self.log(f"Loaded A row data for task {task_id}")
+                    self.stats['a_rows_loaded'] += 1
+            
+            # Remove from outstanding requests
+            del self.outstanding_requests[request_id]
+    
+    def tick(self):
+        """Process one cycle of the scheduler"""
+        self.cycles += 1
+        
+        # Check for completed memory requests
+        if hasattr(self.hbm_memory, 'completed_requests'):
+            for request in self.hbm_memory.completed_requests:
+                self._handle_memory_response(request)
+        
+        # Check for completed tasks on PEs
+        for pe_id in range(self.num_pes):
+            if pe_id in self.running_tasks and self.pes[pe_id].idle:
+                self._handle_task_completion(pe_id)
+        
+        # Update task readiness based on completed dependencies
+        self._update_ready_tasks()
+        
+        # Dispatch ready tasks to available PEs
+        for pe_id in range(self.num_pes):
+            if self.pe_ready[pe_id]:
+                # Find a ready task to dispatch
+                task = self._find_ready_task()
+                if task:
+                    self._dispatch_task_to_pe(pe_id, task)
+                else:
+                    # No ready tasks, PE remains idle
+                    self.stats['idle_cycles'] += 1
+            else:
+                # PE is busy
+                self.stats['active_cycles'] += 1
+        
+        # Check if all rows are completed
+        if self.rows_completed == self.total_rows and self.total_rows > 0:
+            self.log(f"All {self.rows_completed} rows completed!")
+            return True  # Signal completion of current matrix operation
+        
+        return False  # Not done yet
+    
+    def is_complete(self):
+        """Check if the current matrix operation is complete"""
+        return self.rows_completed == self.total_rows and self.total_rows > 0
     
     def get_stats(self):
-        """Get statistics about the GammaCluster's operation"""
-        # Collect stats from all PEs
-        pe_stats = [pe.get_stats() for pe in self.pes]
-        
-        # Compute average utilization
-        avg_utilization = sum(stats["utilization"] for stats in pe_stats) / len(self.pes)
-        
-        # Update overall stats
-        self.stats['pe_utilization'] = avg_utilization
-        self.stats['memory_accesses'] = sum(stats["num_reads"] + stats["num_writes"] + stats["num_consumes"] 
-                                           for stats in pe_stats)
-        
+        """Get statistics about the scheduler's operation"""
         return {
-            **self.stats,
-            'pe_stats': pe_stats
+            'cycles': self.cycles,
+            'rows_completed': self.rows_completed,
+            'total_rows': self.total_rows,
+            'tasks_created': self.stats['tasks_created'],
+            'tasks_dispatched': self.stats['tasks_dispatched'],
+            'tasks_completed': self.stats['tasks_completed'],
+            'memory_requests': self.stats['memory_requests'],
+            'idle_cycles': self.stats['idle_cycles'],
+            'active_cycles': self.stats['active_cycles'],
+            'utilization': self.stats['active_cycles'] / max(1, self.cycles),
+            'a_rows_loaded': self.stats['a_rows_loaded'],
+            'b_rows_loaded': self.stats['b_rows_loaded'],
         }
