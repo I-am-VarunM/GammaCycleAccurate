@@ -14,6 +14,7 @@ class GammaScheduler:
         self.num_pes = num_pes
         self.pe_radix = pe_radix
         self.debug = debug
+        self.elements_per_block = 16  # Number of non-zero elements per block
         
         # References to PE instances (to be set later)
         self.pes = []
@@ -40,7 +41,6 @@ class GammaScheduler:
         # CSR row pointers - needed to determine row sizes
         self.rowptr_a = None
         self.rowptr_a_addr = None
-        self.rowptr_a_request_id = None
         self.rowptr_a_loaded = False
         
         # Task tree tracking
@@ -123,15 +123,30 @@ class GammaScheduler:
         self.partial_outputs = {}
         self.next_partial_output_addr = output_matrix_base_addr + (matrix_a_rows * 2 * 4)  # Assuming 4 bytes per element
         
-        # Request row pointers for matrix A
+        # Request row pointers for matrix A in blocks
+        # Calculate number of blocks needed for row pointers
         self.rowptr_a_loaded = False
-        self.rowptr_a_request_id = self.hbm_memory.read(rowptr_a_addr, (matrix_a_rows + 1) * 4)  # Assuming 4 bytes per pointer
-        self.outstanding_requests[self.rowptr_a_request_id] = {
-            'type': 'rowptr_a',
-            'addr': rowptr_a_addr,
-            'size': (matrix_a_rows + 1) * 4
-        }
-        self.log(f"Requested row pointers for matrix A from address {rowptr_a_addr}")
+        self.rowptr_a = []
+        self.rowptr_blocks_needed = ((matrix_a_rows + 1) + self.elements_per_block - 1) // self.elements_per_block
+        self.rowptr_blocks_received = 0
+        
+        # Request each block of row pointers
+        for block_idx in range(self.rowptr_blocks_needed):
+            start_element = block_idx * self.elements_per_block
+            elements_in_block = min(self.elements_per_block, matrix_a_rows + 1 - start_element)
+            block_addr = rowptr_a_addr + (start_element * 4)  # Assuming 4 bytes per element
+            
+            request_id = self.hbm_memory.read(block_addr, elements_in_block * 4)
+            
+            self.outstanding_requests[request_id] = {
+                'type': 'rowptr_block',
+                'block_idx': block_idx,
+                'addr': block_addr,
+                'size': elements_in_block * 4
+            }
+            
+            self.log(f"Requested row pointer block {block_idx+1}/{self.rowptr_blocks_needed} from address {block_addr}")
+            self.stats['memory_requests'] += 1
     
     def _create_task_tree(self, row_id, nonzeros):
         """Create a task tree for a row with more nonzeros than the PE radix
@@ -299,6 +314,48 @@ class GammaScheduler:
         
         return None
     
+    def _request_a_row(self, task_id, row_addr, row_nnz):
+        """Request an A row from memory, handling block-based access
+        
+        Args:
+            task_id: ID of the task this row is for
+            row_addr: Starting address of the row
+            row_nnz: Number of nonzeros in the row
+        """
+        task = self.scoreboard[task_id]
+        
+        # Calculate number of blocks needed
+        num_blocks = (row_nnz + self.elements_per_block - 1) // self.elements_per_block
+        
+        # Initialize tracking for this request
+        task['a_row_blocks_needed'] = num_blocks
+        task['a_row_blocks_received'] = 0
+        task['a_row_indices'] = []
+        task['a_row_values'] = []
+        task['a_row_block_requests'] = []
+        
+        # Request each block
+        for block_idx in range(num_blocks):
+            start_element = block_idx * self.elements_per_block
+            elements_in_block = min(self.elements_per_block, row_nnz - start_element)
+            block_addr = row_addr + (start_element * 4)  # Assuming 4 bytes per element
+            
+            # Request this block
+            request_id = self.hbm_memory.read(block_addr, elements_in_block * 4)
+            task['a_row_block_requests'].append(request_id)
+            
+            # Track in outstanding requests
+            self.outstanding_requests[request_id] = {
+                'type': 'a_row_block',
+                'task_id': task_id,
+                'block_idx': block_idx,
+                'addr': block_addr,
+                'size': elements_in_block * 4
+            }
+            
+            self.log(f"Requested A row block {block_idx+1}/{num_blocks} for task {task_id} from address {block_addr}")
+            self.stats['memory_requests'] += 1
+    
     def _create_simple_task(self, row_id, nnz):
         """Create a simple task for a row that fits in a single PE
         
@@ -311,6 +368,7 @@ class GammaScheduler:
         """
         task_id = self.next_task_id
         self.next_task_id += 1
+        self.stats['tasks_created'] += 1
         
         # Calculate addresses for this row
         a_row_addr = self.matrix_a_base_addr + self.rowptr_a[row_id] * 4  # Assuming 4 bytes per element
@@ -328,23 +386,14 @@ class GammaScheduler:
             'a_row_addr': a_row_addr,
             'a_row_nnz': nnz,
             'a_row_loaded': False,
-            'a_row_request_id': None,
             'ready': False  # Will be set to True when A row is loaded
         }
         
         # Add to scoreboard
         self.scoreboard[task_id] = task
         
-        # Request A row
-        a_row_request_id = self.hbm_memory.read(a_row_addr, nnz * 4)  # Assuming 4 bytes per element
-        task['a_row_request_id'] = a_row_request_id
-        self.outstanding_requests[a_row_request_id] = {
-            'type': 'a_row',
-            'task_id': task_id,
-            'addr': a_row_addr,
-            'size': nnz * 4
-        }
-        self.log(f"Requested A row {row_id} from address {a_row_addr}")
+        # Request A row in blocks
+        self._request_a_row(task_id, a_row_addr, nnz)
         
         return task
     
@@ -360,6 +409,7 @@ class GammaScheduler:
         """
         task_id = self.next_task_id
         self.next_task_id += 1
+        self.stats['tasks_created'] += 1
         node['task_id'] = task_id
         
         # Determine if this is a root task
@@ -404,16 +454,8 @@ class GammaScheduler:
             task['a_row_nnz'] = a_row_nnz
             task['a_row_loaded'] = False
             
-            # Request A row segment
-            a_row_request_id = self.hbm_memory.read(a_row_addr, a_row_nnz * 4)  # Assuming 4 bytes per element
-            task['a_row_request_id'] = a_row_request_id
-            self.outstanding_requests[a_row_request_id] = {
-                'type': 'a_row',
-                'task_id': task_id,
-                'addr': a_row_addr,
-                'size': a_row_nnz * 4
-            }
-            self.log(f"Requested A row {row_id} segment [{a_start}:{a_end}] from address {a_row_addr}")
+            # Request A row segment in blocks
+            self._request_a_row(task_id, a_row_addr, a_row_nnz)
         
         # For internal nodes, inputs come from child tasks
         else:
@@ -519,6 +561,7 @@ class GammaScheduler:
                 # Internal node in task tree - needs partial results from child tasks
                 input_row_data = []
                 scaling_factors = []
+                input_consume_flags = []  # Add this to track which inputs to consume
                 
                 # For each input task, add its output as an input
                 for i, input_task_id in enumerate(task['input_tasks']):
@@ -531,10 +574,12 @@ class GammaScheduler:
                     
                     input_row_data.append((input_addr, input_addr + input_size * 4, 0, input_size))
                     scaling_factors.append(1.0)  # Scale factor is 1.0 for partial outputs
+                    input_consume_flags.append(True)  # Mark partial results for consumption
                 
-                # Create the PE task
+                # Create the PE task with consume flags
                 pe_task = {
                     'input_row_data': input_row_data,
+                    'input_consume_flags': input_consume_flags,
                     'scaling_factors': scaling_factors,
                     'output_col_indices_addr': task['output_col_indices_addr'],
                     'output_values_addr': task['output_values_addr']
@@ -604,7 +649,7 @@ class GammaScheduler:
             
             if task['type'] == 'simple':
                 # Simple task is ready when A row is loaded
-                if task['a_row_loaded']:
+                if task.get('a_row_loaded', False):
                     task['ready'] = True
                     if task not in self.pending_tasks:
                         self.pending_tasks.append(task)
@@ -641,15 +686,24 @@ class GammaScheduler:
         if request_id in self.outstanding_requests:
             req_info = self.outstanding_requests[request_id]
             
-            if req_info['type'] == 'rowptr_a':
-                # Row pointers for matrix A
-                self.rowptr_a = request['data']
-                self.rowptr_a_loaded = True
-                self.log(f"Loaded row pointers for matrix A: {self.rowptr_a}")
+            if req_info['type'] == 'rowptr_block':
+                # Block of row pointers for matrix A
+                block_idx = req_info['block_idx']
+                
+                # Parse the data
+                self.rowptr_a.extend(request['data'])
+                self.rowptr_blocks_received += 1
+                
+                # Check if all blocks received
+                if self.rowptr_blocks_received == self.rowptr_blocks_needed:
+                    self.rowptr_a_loaded = True
+                    self.log(f"Loaded all row pointers for matrix A: {len(self.rowptr_a)} pointers")
             
-            elif req_info['type'] == 'a_row':
-                # A row or A row segment
+            elif req_info['type'] == 'a_row_block':
+                # A row block
                 task_id = req_info['task_id']
+                block_idx = req_info['block_idx']
+                
                 if task_id in self.scoreboard:
                     task = self.scoreboard[task_id]
                     
@@ -660,21 +714,27 @@ class GammaScheduler:
                     indices = []
                     values = []
                     for i in range(0, len(data), 2):
-                        indices.append(data[i])
-                        values.append(data[i+1])
+                        if i + 1 < len(data):  # Make sure we have both index and value
+                            indices.append(data[i])
+                            values.append(data[i+1])
                     
-                    task['a_row_indices'] = indices
-                    task['a_row_values'] = values
-                    task['a_row_loaded'] = True
+                    # Add this block's data to the task
+                    task['a_row_indices'].extend(indices)
+                    task['a_row_values'].extend(values)
+                    task['a_row_blocks_received'] += 1
                     
-                    # Update task readiness
-                    if not task.get('ready', False):
-                        task['ready'] = True
-                        if task not in self.pending_tasks:
-                            self.pending_tasks.append(task)
-                    
-                    self.log(f"Loaded A row data for task {task_id}")
-                    self.stats['a_rows_loaded'] += 1
+                    # Check if all blocks received
+                    if task['a_row_blocks_received'] == task['a_row_blocks_needed']:
+                        task['a_row_loaded'] = True
+                        
+                        # Update task readiness
+                        if not task.get('ready', False):
+                            task['ready'] = True
+                            if task not in self.pending_tasks:
+                                self.pending_tasks.append(task)
+                        
+                        self.log(f"Completed loading all blocks for A row in task {task_id}")
+                        self.stats['a_rows_loaded'] += 1
             
             # Remove from outstanding requests
             del self.outstanding_requests[request_id]
@@ -683,7 +743,7 @@ class GammaScheduler:
         """Process one cycle of the scheduler"""
         self.cycles += 1
         
-        # Check for completed memory requests
+        # Check for completed memory requests from HBM
         if hasattr(self.hbm_memory, 'completed_requests'):
             for request in self.hbm_memory.completed_requests:
                 self._handle_memory_response(request)
